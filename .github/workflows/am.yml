@@ -67,7 +67,8 @@ jobs:
 
       - name: Install Python dependencies (for scanning & Drive uploader)
         run: |
-          python3 -m pip install requests beautifulsoup4 wappalyzer-python sublist3r google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib
+          python3 -m pip install requests beautifulsoup4 sublist3r google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib
+          python3 -m pip install wappalyzer-python==0.1.2 --no-build-isolation
 
       - name: Create Results Directory
         run: mkdir -p results/{subdomains,tech,content,inputs}
