@@ -73,9 +73,9 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y libxml2-dev libxslt-dev python3-lxml
-          pip install --upgrade pip
-          pip install wappalyzer-python==0.1.2 --no-build-isolation
-          pip install -r requirements.txt --no-cache-dir --upgrade --no-build-isolation
+          python3 -m pip install --upgrade pip
+          python3 -m pip install wappalyzer-python==0.1.2 --no-build-isolation
+          python3 -m pip install -r requirements.txt --no-cache-dir --upgrade --no-build-isolation
           
       - name: Create Results Directory
         run: mkdir -p results/{subdomains,tech,content,inputs}
