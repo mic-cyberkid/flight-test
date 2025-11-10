@@ -1,0 +1,239 @@
+name: AMA.gov.gh Pentest - Recon + Google Drive Upload
+
+on:
+  workflow_dispatch:
+    inputs:
+      drive_folder_id:
+        description: 'Google Drive Folder ID for results'
+        required: true
+        type: string
+
+env:
+  TZ: Africa/Accra  # Set timezone to Accra, Ghana
+  DRIVE_FOLDER_ID: ${{ inputs.drive_folder_id }}
+  GDRIVE_CLIENT_SECRET_JSON: ${{ secrets.GDRIVE_CLIENT_SECRET_JSON }}
+
+jobs:
+  pentest-recon:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y amass sublist3r whatweb gobuster ffuf dnsrecon jq wget curl
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install github.com/tomnomnom/assetfinder@latest
+          sudo cp ~/go/bin/* /usr/local/bin/
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 wappalyzer-python
+
+      - name: Create Results Directory
+        run: mkdir -p results/{subdomains,tech,content,inputs}
+
+      # ===================== PHASE 1: INTELLIGENCE GATHERING =====================
+
+      - name: "[1] Subdomain Enumeration"
+        run: |
+          echo "Starting subdomain enumeration at $(date '+%Y-%m-%d %H:%M:%S %Z') in Accra"
+
+          amass enum -d ama.gov.gh -brute -active -o results/subdomains/amass.txt
+          subfinder -d ama.gov.gh -o results/subdomains/subfinder.txt
+          assetfinder --subs-only ama.gov.gh > results/subdomains/assetfinder.txt
+          python3 -m sublist3r -d ama.gov.gh -o results/subdomains/sublist3r.txt
+
+          cat results/subdomains/*.txt | sort -u > results/subdomains/all.txt
+          echo "Unique subdomains: $(wc -l < results/subdomains/all.txt)"
+          head -15 results/subdomains/all.txt
+
+      - name: "[2] Live Host Probing"
+        run: |
+          httpx -l results/subdomains/all.txt \
+                -title -status-code -tech-detect \
+                -o results/subdomains/live.jsonl
+
+          grep -E '"status_code": 200' results/subdomains/live.jsonl | \
+            jq -r '.url' > results/subdomains/live.txt
+
+          echo "Live hosts: $(wc -l < results/subdomains/live.txt)"
+          cat results/subdomains/live.txt
+
+      - name: "[3] Technology Fingerprinting"
+        run: |
+          whatweb --log-json=results/tech/whatweb.json $(cat results/subdomains/live.txt | head -20)
+
+          cat << 'PY' > tech_scan.py
+          import json, requests
+          from Wappalyzer import WebPage, Wappalyzer
+
+          urls = open("results/subdomains/live.txt").read().splitlines()[:15]
+          results = []
+
+          for url in urls:
+              try:
+                  wp = WebPage.new_from_url(url, timeout=10)
+                  tech = Wappalyzer.latest().analyze_with_versions_and_categories(wp)
+                  results.append({"url": url, "tech": tech})
+                  print(f"{url} -> {list(tech.keys())[:5]}")
+              except: pass
+
+          with open("results/tech/wappalyzer.json", "w") as f:
+              json.dump(results, f, indent=2)
+          PY
+          python tech_scan.py
+
+      - name: "[4] Content Discovery"
+        run: |
+          wget -q https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-medium-directories.txt -O dirs.txt
+          TARGETS=$(cat results/subdomains/live.txt | head -10 | paste -sd, -)
+
+          ffuf -u "FUZZ" -w dirs.txt -H "Host: FUZZ" \
+               -mc 200,301,302 -ac -t 50 \
+               -od results/content/ffuf_dirs -of json \
+               -w results/subdomains/live.txt:FUZZ
+
+      - name: "[5] Form & API Crawler"
+        run: |
+          cat << 'PY' > crawler.py
+          import requests, json, re
+          from bs4 import BeautifulSoup
+          from urllib.parse import urljoin, urlparse
+
+          visited, forms, apis, inputs = set(), [], [], []
+
+          def extract(soup, url):
+              for form in soup.find_all('form'):
+                  action = urljoin(url, form.get('action', ''))
+                  inputs_list = [i.get('name') or i.get('id', 'no-name') for i in form.find_all(['input', 'textarea'])]
+                  forms.append({"url": url, "action": action, "inputs": inputs_list})
+              text = soup.get_text() + str(soup)
+              for pattern in [r'["\']/api/[^\s"\']+', r'fetch\(["\']([^"\']+)']:
+                  for m in re.findall(pattern, text):
+                      full = urljoin(url, m.split('?')[0])
+                      if full not in apis and full.startswith('http'):
+                          apis.append(full)
+
+          def crawl(url, depth=2):
+              if depth == 0 or url in visited: return
+              visited.add(url)
+              try:
+                  r = requests.get(url, timeout=8, verify=False, headers={'User-Agent': 'PentestBot/1.0'})
+                  if r.status_code != 200: return
+                  soup = BeautifulSoup(r.text, 'html.parser')
+                  extract(soup, url)
+                  for a in soup.find_all('a', href=True)[:20]:
+                      link = urljoin(url, a['href'])
+                      if urlparse(link).netloc == urlparse(url).netloc:
+                          crawl(link, depth-1)
+              except: pass
+
+          with open("results/subdomains/live.txt") as f:
+              for url in [l.strip() for l in f][:5]:
+                  print(f"Crawling {url}")
+                  crawl(url)
+
+          json.dump(forms, open("results/inputs/forms.json", "w"), indent=2)
+          json.dump(list(set(apis)), open("results/inputs/apis.json", "w"), indent=2)
+          PY
+          python crawler.py
+
+      - name: "[6] Generate Summary Report"
+        run: |
+          cat << EOF > results/SUMMARY.md
+          # AMA.gov.gh Penetration Test Report
+          **Generated:** $(date '+%Y-%m-%d %H:%M:%S %Z') | Accra, Ghana
+          **Scope:** ama.gov.gh & subdomains
+
+          ## Subdomains
+          - Total: \$(wc -l < results/subdomains/all.txt)
+          - Live: \$(wc -l < results/subdomains/live.txt)
+
+          ## Technology
+          \$(jq -r '.[] | "- " + .url + ": " + (.tech | keys | join(", "))' results/tech/wappalyzer.json | head -10)
+
+          ## Inputs
+          - Forms: \$(jq 'length' results/inputs/forms.json)
+          - APIs: \$(jq 'length' results/inputs/apis.json)
+
+          **Next:** Manual testing, Nuclei, Burp collaboration.
+          EOF
+          cat results/SUMMARY.md
+
+      # ===================== UPLOAD TO GOOGLE DRIVE =====================
+
+      - name: "Upload Results to Google Drive"
+        run: |
+          cat << 'PY' > drive_uploader.py
+          #!/usr/bin/env python3
+          import os, pickle, sys, json, tempfile
+          from google.auth.transport.requests import Request
+          from google.oauth2.credentials import Credentials
+          from google_auth_oauthlib.flow import InstalledAppFlow
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload
+
+          SCOPES = ['https://www.googleapis.com/auth/drive.file']
+          CLIENT_SECRET_JSON = os.getenv('GDRIVE_CLIENT_SECRET_JSON')
+          DRIVE_FOLDER_ID = os.getenv('DRIVE_FOLDER_ID')
+          TOKEN_PICKLE = '/tmp/token.pickle'
+
+          def load_or_create_token():
+              creds = None
+              if os.path.exists(TOKEN_PICKLE):
+                  with open(TOKEN_PICKLE, 'rb') as f:
+                      creds = pickle.load(f)
+              if not creds or not creds.valid:
+                  if creds and creds.expired and creds.refresh_token:
+                      creds.refresh(Request())
+                  else:
+                      with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as tmp:
+                          tmp.write(CLIENT_SECRET_JSON)
+                          tmp_path = tmp.name
+                      flow = InstalledAppFlow.from_client_secrets_file(tmp_path, SCOPES)
+                      creds = flow.run_console()
+                      os.unlink(tmp_path)
+                  with open(TOKEN_PICKLE, 'wb') as f:
+                      pickle.dump(creds, f)
+              return creds
+
+          def upload_file(service, path, folder_id):
+              name = os.path.basename(path)
+              metadata = {'name': name, 'parents': [folder_id]}
+              media = MediaFileUpload(path, resumable=True)
+              print(f"Uploading {path}...")
+              file = service.files().create(body=metadata, media_body=media, fields='id,name,webViewLink').execute()
+              print(f"Success: {file.get('name')} -> {file.get('webViewLink')}")
+
+          if not CLIENT_SECRET_JSON or not DRIVE_FOLDER_ID:
+              sys.exit("Missing GDRIVE_CLIENT_SECRET_JSON or DRIVE_FOLDER_ID")
+
+          creds = load_or_create_token()
+          service = build('drive', 'v3', credentials=creds)
+
+          import glob
+          for file_path in glob.glob("results/**/*", recursive=True):
+              if os.path.isfile(file_path):
+                  upload_file(service, file_path, DRIVE_FOLDER_ID)
+          PY
+
+          chmod +x drive_uploader.py
+          python drive_uploader.py
+
+      - name: "Final Success Message"
+        run: |
+          echo "Pentest Phase 1 & 2 Complete"
+          echo "All results uploaded to Google Drive (Folder ID: $DRIVE_FOLDER_ID)"
+          echo "Time in Accra: $(date '+%Y-%m-%d %H:%M:%S %Z')"
