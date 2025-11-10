@@ -85,8 +85,6 @@ jobs:
           mkdir -p results/subdomains
 
           amass enum -d "$TARGET" -passive -o results/subdomains/amass_passive.txt || true
-          subfinder -d "$TARGET" -o results/subdomains/subfinder.txt || true
-          assetfinder --subs-only "$TARGET" > results/subdomains/assetfinder.txt || true
           python3 -m sublist3r -d "$TARGET" -o results/subdomains/sublist3r.txt || true
 
           cat results/subdomains/*.txt 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sort -u > results/subdomains/all.txt || true
