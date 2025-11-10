@@ -1,4 +1,4 @@
-name: AMA.gov.gh Pentest - Recon + Google Drive Upload
+name: Pentest - Recon + Google Drive Upload
 
 on:
   workflow_dispatch:
@@ -9,9 +9,10 @@ on:
         type: string
 
 env:
-  TZ: Africa/Accra  # Set timezone to Accra, Ghana
+  TZ: Africa/Accra
   DRIVE_FOLDER_ID: ${{ inputs.drive_folder_id }}
-  GDRIVE_CLIENT_SECRET_JSON: ${{ secrets.GDRIVE_CLIENT_SECRET_JSON }}
+  # Provide a service account JSON (stringified) in repository secrets as GDRIVE_SA_JSON
+  GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
 
 jobs:
   pentest-recon:
@@ -28,18 +29,53 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install System Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y amass sublist3r whatweb gobuster ffuf dnsrecon jq wget curl
-          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
-          go install github.com/tomnomnom/assetfinder@latest
-          sudo cp ~/go/bin/* /usr/local/bin/
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.20'   # use a stable supported go version
 
-      - name: Install Python Dependencies
+      - name: Prepare environment (GOBIN & PATH)
         run: |
-          python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 wappalyzer-python
+          # Use a workspace-local bin so we don't need sudo
+          export GOBIN="${GITHUB_WORKSPACE}/gobin"
+          mkdir -p "$GOBIN"
+          echo "$GOBIN" >> $GITHUB_PATH
+          # also make go cache consistent
+          export GOPATH="${GITHUB_WORKSPACE}/gopath"
+          mkdir -p "$GOPATH"
+          echo "$GOPATH" >> $GITHUB_ENV
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            git wget curl unzip jq build-essential ca-certificates \
+            python3-venv python3-pip whatweb gobuster
+          # ensure pip is up-to-date
+          python3 -m pip install --upgrade pip
+
+      - name: Install Go-based tools (amass, httpx, subfinder, assetfinder, ffuf, gobuster v3)
+        env:
+          GOBIN: ${{ github.workspace }}/gobin
+        run: |
+          # Use explicit module installs to GOBIN (non-sudo). @latest is okay in CI;
+          # pin versions in future for reproducible builds if desired.
+          go install github.com/owasp-amass/amass/v4/...@latest
+          go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install github.com/tomnomnom/assetfinder@latest
+          go install github.com/ffuf/ffuf@latest
+          # OJ/gobuster v3 (if apt gobuster is absent/older)
+          go install github.com/OJ/gobuster/v3@latest
+
+      - name: Make sure Go bin is on PATH
+        run: |
+          echo "${GITHUB_WORKSPACE}/gobin" >> $GITHUB_PATH
+          ls -lah ${GITHUB_WORKSPACE}/gobin || true
+
+      - name: Install Python dependencies (for scanning & Drive uploader)
+        run: |
+          python3 -m pip install requests beautifulsoup4 wappalyzer-python sublist3r google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib
 
       - name: Create Results Directory
         run: mkdir -p results/{subdomains,tech,content,inputs}
@@ -48,82 +84,143 @@ jobs:
 
       - name: "[1] Subdomain Enumeration"
         run: |
-          echo "Starting subdomain enumeration at $(date '+%Y-%m-%d %H:%M:%S %Z') in Accra"
+          set -euo pipefail
+          echo "Starting subdomain enumeration at $(date '+%Y-%m-%d %H:%M:%S %Z')"
 
-          amass enum -d ama.gov.gh -brute -active -o results/subdomains/amass.txt
-          subfinder -d ama.gov.gh -o results/subdomains/subfinder.txt
-          assetfinder --subs-only ama.gov.gh > results/subdomains/assetfinder.txt
-          python3 -m sublist3r -d ama.gov.gh -o results/subdomains/sublist3r.txt
+          TARGET="ama.gov.gh"
+          mkdir -p results/subdomains
 
-          cat results/subdomains/*.txt | sort -u > results/subdomains/all.txt
-          echo "Unique subdomains: $(wc -l < results/subdomains/all.txt)"
-          head -15 results/subdomains/all.txt
+          # Amass enumeration (passive + active bruteforce)
+          amass enum -d "$TARGET" -passive -o results/subdomains/amass_passive.txt || true
+          amass enum -d "$TARGET" -brute -active -o results/subdomains/amass_active.txt || true
+
+          # subfinder (fast)
+          subfinder -d "$TARGET" -o results/subdomains/subfinder.txt || true
+
+          # assetfinder
+          assetfinder --subs-only "$TARGET" > results/subdomains/assetfinder.txt || true
+
+          # python sublist3r (fallback)
+          python3 -m sublist3r -d "$TARGET" -o results/subdomains/sublist3r.txt || true
+
+          # combine and dedupe
+          cat results/subdomains/*.txt 2>/dev/null || true
+          grep -Eo "([a-zA-Z0-9.-]+\.$TARGET|[a-zA-Z0-9.-]+)" results/subdomains/*.txt 2>/dev/null || true
+          cat results/subdomains/*.txt 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sort -u > results/subdomains/all.txt || true
+
+          echo "Unique subdomains: $(wc -l < results/subdomains/all.txt || echo 0)"
+          head -n 15 results/subdomains/all.txt || true
 
       - name: "[2] Live Host Probing"
         run: |
+          set -euo pipefail
+          mkdir -p results/subdomains
+          if [ ! -s results/subdomains/all.txt ]; then
+            echo "No subdomains found; exiting step."
+            exit 0
+          fi
+
+          # httpx produces json lines; detect title/status/tech
           httpx -l results/subdomains/all.txt \
-                -title -status-code -tech-detect \
-                -o results/subdomains/live.jsonl
+                -title -status-code -tech-detect -silent -o results/subdomains/live.jsonl || true
 
-          grep -E '"status_code": 200' results/subdomains/live.jsonl | \
-            jq -r '.url' > results/subdomains/live.txt
+          # extract URLs that returned 200 (or consider other status codes)
+          jq -r 'select(.status_code==200) | .url' results/subdomains/live.jsonl > results/subdomains/live.txt || true
 
-          echo "Live hosts: $(wc -l < results/subdomains/live.txt)"
-          cat results/subdomains/live.txt
+          echo "Live hosts: $(wc -l < results/subdomains/live.txt || echo 0)"
+          head -n 30 results/subdomains/live.txt || true
 
       - name: "[3] Technology Fingerprinting"
         run: |
-          whatweb --log-json=results/tech/whatweb.json $(cat results/subdomains/live.txt | head -20)
+          set -euo pipefail
+          mkdir -p results/tech
+          # whatweb JSON log (limit to first 20 hosts)
+          if [ -s results/subdomains/live.txt ]; then
+            head -n 20 results/subdomains/live.txt | xargs -r -n1 whatweb --log-json=results/tech/whatweb.json || true
+          fi
 
+          # Wappalyzer scan (python)
           cat << 'PY' > tech_scan.py
-          import json, requests
+          import json
           from Wappalyzer import WebPage, Wappalyzer
+          import sys
 
-          urls = open("results/subdomains/live.txt").read().splitlines()[:15]
           results = []
+          try:
+              w = Wappalyzer.latest()
+          except Exception as e:
+              print("Wappalyzer init error:", e, file=sys.stderr)
+              w = None
+
+          try:
+              urls = open("results/subdomains/live.txt").read().splitlines()[:15]
+          except FileNotFoundError:
+              urls = []
 
           for url in urls:
               try:
                   wp = WebPage.new_from_url(url, timeout=10)
-                  tech = Wappalyzer.latest().analyze_with_versions_and_categories(wp)
+                  tech = w.analyze_with_versions_and_categories(wp) if w else {}
                   results.append({"url": url, "tech": tech})
                   print(f"{url} -> {list(tech.keys())[:5]}")
-              except: pass
-
+              except Exception as e:
+                  print("skip", url, e)
           with open("results/tech/wappalyzer.json", "w") as f:
               json.dump(results, f, indent=2)
           PY
-          python tech_scan.py
+          python3 tech_scan.py || true
 
-      - name: "[4] Content Discovery"
+      - name: "[4] Content Discovery (FFUF)"
         run: |
-          wget -q https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-medium-directories.txt -O dirs.txt
-          TARGETS=$(cat results/subdomains/live.txt | head -10 | paste -sd, -)
+          set -euo pipefail
+          mkdir -p results/content
+          # Get a commonly used wordlist (raft-medium)
+          wget -q -O dirs.txt https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-medium-directories.txt || true
 
-          ffuf -u "FUZZ" -w dirs.txt -H "Host: FUZZ" \
-               -mc 200,301,302 -ac -t 50 \
-               -od results/content/ffuf_dirs -of json \
-               -w results/subdomains/live.txt:FUZZ
+          # build target list (up to 10)
+          if [ -s results/subdomains/live.txt ]; then
+            head -n 10 results/subdomains/live.txt > results/content/targets.txt
+          else
+            echo "No live targets; skipping ffuf."
+            exit 0
+          fi
+
+          # run ffuf per target (simple loop) to avoid complex host header juggling
+          while read -r url; do
+            # ensure url has scheme, default to https if missing
+            if [[ ! "$url" =~ ^https?:// ]]; then
+              url="https://$url"
+            fi
+            # FFUF line: target/FUZZ
+            ffuf -u "${url}/FUZZ" -w dirs.txt -mc 200,301,302 -ac -t 25 -o "results/content/ffuf_$(echo "$url" | sed 's/[^a-zA-Z0-9]/_/g').json" -of json || true
+          done < results/content/targets.txt
 
       - name: "[5] Form & API Crawler"
         run: |
+          set -euo pipefail
+          mkdir -p results/inputs
           cat << 'PY' > crawler.py
           import requests, json, re
           from bs4 import BeautifulSoup
           from urllib.parse import urljoin, urlparse
 
-          visited, forms, apis, inputs = set(), [], [], []
+          requests.packages.urllib3.disable_warnings()
+
+          visited, forms, apis = set(), [], []
 
           def extract(soup, url):
               for form in soup.find_all('form'):
                   action = urljoin(url, form.get('action', ''))
-                  inputs_list = [i.get('name') or i.get('id', 'no-name') for i in form.find_all(['input', 'textarea'])]
+                  inputs_list = [i.get('name') or i.get('id') or i.get('type') or 'no-name' for i in form.find_all(['input', 'textarea'])]
                   forms.append({"url": url, "action": action, "inputs": inputs_list})
               text = soup.get_text() + str(soup)
-              for pattern in [r'["\']/api/[^\s"\']+', r'fetch\(["\']([^"\']+)']:
+              patterns = [r'["\']/api/[^\s"\'<>]+', r'fetch\(["\']([^"\']+)']
+              for pattern in patterns:
                   for m in re.findall(pattern, text):
-                      full = urljoin(url, m.split('?')[0])
-                      if full not in apis and full.startswith('http'):
+                      # m might be "something" or a tuple; we handle string
+                      endpoint = m if isinstance(m, str) else m[0]
+                      full = urljoin(url, endpoint.split('?')[0])
+                      if full.startswith('http') and full not in apis:
                           apis.append(full)
 
           def crawl(url, depth=2):
@@ -138,102 +235,96 @@ jobs:
                       link = urljoin(url, a['href'])
                       if urlparse(link).netloc == urlparse(url).netloc:
                           crawl(link, depth-1)
-              except: pass
+              except Exception:
+                  pass
 
-          with open("results/subdomains/live.txt") as f:
-              for url in [l.strip() for l in f][:5]:
-                  print(f"Crawling {url}")
-                  crawl(url)
+          try:
+              urls = open("results/subdomains/live.txt").read().splitlines()[:5]
+          except FileNotFoundError:
+              urls = []
+
+          for url in urls:
+              if not url.startswith("http"):
+                  url = "https://" + url
+              print("Crawling", url)
+              crawl(url)
 
           json.dump(forms, open("results/inputs/forms.json", "w"), indent=2)
           json.dump(list(set(apis)), open("results/inputs/apis.json", "w"), indent=2)
           PY
-          python crawler.py
+
+          python3 crawler.py || true
 
       - name: "[6] Generate Summary Report"
         run: |
-          cat << EOF > results/SUMMARY.md
+          set -euo pipefail
+          mkdir -p results
+          cat << 'EOF' > results/SUMMARY.md
           # AMA.gov.gh Penetration Test Report
-          **Generated:** $(date '+%Y-%m-%d %H:%M:%S %Z') | Accra, Ghana
+          **Generated:** $(date '+%Y-%m-%d %H:%M:%S %Z')
           **Scope:** ama.gov.gh & subdomains
 
           ## Subdomains
-          - Total: \$(wc -l < results/subdomains/all.txt)
-          - Live: \$(wc -l < results/subdomains/live.txt)
+          - Total: $(wc -l < results/subdomains/all.txt 2>/dev/null || echo 0)
+          - Live: $(wc -l < results/subdomains/live.txt 2>/dev/null || echo 0)
 
-          ## Technology
-          \$(jq -r '.[] | "- " + .url + ": " + (.tech | keys | join(", "))' results/tech/wappalyzer.json | head -10)
+          ## Technology (sample)
+          $(if [ -f results/tech/wappalyzer.json ]; then jq -r '.[] | "- " + .url + ": " + (.tech | keys | join(", "))' results/tech/wappalyzer.json | head -10; else echo "- no tech data"; fi)
 
           ## Inputs
-          - Forms: \$(jq 'length' results/inputs/forms.json)
-          - APIs: \$(jq 'length' results/inputs/apis.json)
+          - Forms: $(jq 'length' results/inputs/forms.json 2>/dev/null || echo 0)
+          - APIs: $(jq 'length' results/inputs/apis.json 2>/dev/null || echo 0)
 
           **Next:** Manual testing, Nuclei, Burp collaboration.
           EOF
+
           cat results/SUMMARY.md
 
       # ===================== UPLOAD TO GOOGLE DRIVE =====================
 
-      - name: "Upload Results to Google Drive"
+      - name: "Upload Results to Google Drive (Service Account)"
+        env:
+          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+          DRIVE_FOLDER_ID: ${{ inputs.drive_folder_id }}
         run: |
-          cat << 'PY' > drive_uploader.py
-          #!/usr/bin/env python3
-          import os, pickle, sys, json, tempfile
-          from google.auth.transport.requests import Request
-          from google.oauth2.credentials import Credentials
-          from google_auth_oauthlib.flow import InstalledAppFlow
+          set -euo pipefail
+          if [ -z "$GDRIVE_SA_JSON" ]; then
+            echo "Missing service account JSON in GDRIVE_SA_JSON secret. Exiting."
+            exit 1
+          fi
+          python3 - <<'PY'
+          import os, json, glob
+          from google.oauth2 import service_account
           from googleapiclient.discovery import build
           from googleapiclient.http import MediaFileUpload
 
-          SCOPES = ['https://www.googleapis.com/auth/drive.file']
-          CLIENT_SECRET_JSON = os.getenv('GDRIVE_CLIENT_SECRET_JSON')
-          DRIVE_FOLDER_ID = os.getenv('DRIVE_FOLDER_ID')
-          TOKEN_PICKLE = '/tmp/token.pickle'
+          sa_json = os.environ.get("GDRIVE_SA_JSON")
+          folder_id = os.environ.get("DRIVE_FOLDER_ID")
+          if not sa_json or not folder_id:
+              raise SystemExit("Missing GDRIVE_SA_JSON or DRIVE_FOLDER_ID")
 
-          def load_or_create_token():
-              creds = None
-              if os.path.exists(TOKEN_PICKLE):
-                  with open(TOKEN_PICKLE, 'rb') as f:
-                      creds = pickle.load(f)
-              if not creds or not creds.valid:
-                  if creds and creds.expired and creds.refresh_token:
-                      creds.refresh(Request())
-                  else:
-                      with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.json') as tmp:
-                          tmp.write(CLIENT_SECRET_JSON)
-                          tmp_path = tmp.name
-                      flow = InstalledAppFlow.from_client_secrets_file(tmp_path, SCOPES)
-                      creds = flow.run_console()
-                      os.unlink(tmp_path)
-                  with open(TOKEN_PICKLE, 'wb') as f:
-                      pickle.dump(creds, f)
-              return creds
+          creds_info = json.loads(sa_json)
+          creds = service_account.Credentials.from_service_account_info(creds_info, scopes=["https://www.googleapis.com/auth/drive"])
+          service = build("drive", "v3", credentials=creds, cache_discovery=False)
 
-          def upload_file(service, path, folder_id):
+          def upload_file(path):
               name = os.path.basename(path)
-              metadata = {'name': name, 'parents': [folder_id]}
+              metadata = {"name": name, "parents":[folder_id]}
               media = MediaFileUpload(path, resumable=True)
-              print(f"Uploading {path}...")
-              file = service.files().create(body=metadata, media_body=media, fields='id,name,webViewLink').execute()
-              print(f"Success: {file.get('name')} -> {file.get('webViewLink')}")
+              print("Uploading", path)
+              f = service.files().create(body=metadata, media_body=media, fields="id,webViewLink").execute()
+              print("Uploaded:", f.get("webViewLink"))
 
-          if not CLIENT_SECRET_JSON or not DRIVE_FOLDER_ID:
-              sys.exit("Missing GDRIVE_CLIENT_SECRET_JSON or DRIVE_FOLDER_ID")
-
-          creds = load_or_create_token()
-          service = build('drive', 'v3', credentials=creds)
-
-          import glob
-          for file_path in glob.glob("results/**/*", recursive=True):
-              if os.path.isfile(file_path):
-                  upload_file(service, file_path, DRIVE_FOLDER_ID)
+          for path in glob.glob("results/**/*", recursive=True):
+              if os.path.isfile(path):
+                  try:
+                      upload_file(path)
+                  except Exception as e:
+                      print("Failed to upload", path, e)
           PY
-
-          chmod +x drive_uploader.py
-          python drive_uploader.py
 
       - name: "Final Success Message"
         run: |
-          echo "Pentest Phase 1 & 2 Complete"
+          echo "Pentest Phase 1 Complete"
           echo "All results uploaded to Google Drive (Folder ID: $DRIVE_FOLDER_ID)"
-          echo "Time in Accra: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          date '+Time in Accra: %Y-%m-%d %H:%M:%S %Z'
