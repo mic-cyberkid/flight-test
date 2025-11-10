@@ -14,7 +14,7 @@ on:
 
 env:
   TZ: Africa/Accra
-  # Provide a service account JSON (stringified) in repository secrets as GDRIVE_SA_JSON
+  # Put service account JSON (stringified) into repo secret named GDRIVE_SA_JSON
   GDRIVE_SA_JSON: ${{ secrets.GDRIVE_CLIENT_SECRET_JSON }}
 
 jobs:
@@ -22,10 +22,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    # make target and drive folder available to all steps via job-level env
     env:
       DRIVE_FOLDER_ID: ${{ inputs.drive_folder_id }}
       TARGET: ${{ inputs.target }}
+      # ensure uploader uses the same secret name
+      GDRIVE_SA_JSON: ${{ secrets.GDRIVE_CLIENT_SECRET_JSON }}
 
     steps:
       - name: Checkout Repository
@@ -53,6 +54,7 @@ jobs:
         env:
           GOBIN: ${{ github.workspace }}/gobin
         run: |
+          mkdir -p "${GOBIN}"
           go install github.com/owasp-amass/amass/v4/...@latest
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
@@ -63,20 +65,14 @@ jobs:
       - name: Make sure Go bin is on PATH
         run: |
           echo "${GITHUB_WORKSPACE}/gobin" >> $GITHUB_PATH
+          echo "$HOME/go/bin" >> $GITHUB_PATH
           ls -lah ${GITHUB_WORKSPACE}/gobin || true
+          ls -lah $HOME/go/bin || true
 
       - name: Install Python dependencies (for scanning & Drive uploader)
         run: |
           python3 -m pip install requests beautifulsoup4 sublist3r google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib
 
-      - name: Install Python packages
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y libxml2-dev libxslt-dev python3-lxml
-          python3 -m pip install --upgrade pip
-          python3 -m pip install wappalyzer-python==0.1.2 --no-build-isolation
-          python3 -m pip install -r requirements.txt --no-cache-dir --upgrade --no-build-isolation
-          
       - name: Create Results Directory
         run: mkdir -p results/{subdomains,tech,content,inputs}
 
@@ -116,43 +112,102 @@ jobs:
           echo "Live hosts: $(wc -l < results/subdomains/live.txt 2>/dev/null || echo 0)"
           head -n 30 results/subdomains/live.txt || true
 
-      - name: "[3] Technology Fingerprinting"
+      - name: "[3] Technology Fingerprinting (whatweb + httpx)"
         run: |
           set -euo pipefail
           mkdir -p results/tech
+
+          # Use whatweb for a detailed fingerprint (JSON logs)
           if [ -s results/subdomains/live.txt ]; then
-            head -n 20 results/subdomains/live.txt | xargs -r -n1 whatweb --log-json=results/tech/whatweb.json || true
+            # whatweb can accept a list; write one host per line (limit to 20)
+            head -n 20 results/subdomains/live.txt | xargs -r -n1 whatweb --log-json=results/tech/whatweb_raw.json || true
           fi
 
-          cat << 'PY' > tech_scan.py
-          import json
-          from Wappalyzer import WebPage, Wappalyzer
-          import sys
+          # Combine whatweb and httpx outputs into a compact JSON summary
+          cat <<'PY' > results/tech/merge_tech.py
+          import json, sys, os
+          from pathlib import Path
 
-          results = []
-          try:
-              w = Wappalyzer.latest()
-          except Exception as e:
-              print("Wappalyzer init error:", e, file=sys.stderr)
-              w = None
+          def load_httpx(path):
+              res = {}
+              if not os.path.exists(path): return res
+              with open(path) as f:
+                  for line in f:
+                      try:
+                          obj = json.loads(line)
+                          url = obj.get("url") or obj.get("input")
+                          if url:
+                              res[url] = {
+                                  "title": obj.get("title"),
+                                  "status_code": obj.get("status_code"),
+                                  "httpx_tech": obj.get("tech") or {}
+                              }
+                      except Exception:
+                          continue
+              return res
 
-          try:
-              urls = open("results/subdomains/live.txt").read().splitlines()[:15]
-          except FileNotFoundError:
-              urls = []
-
-          for url in urls:
+          def load_whatweb(path):
+              res = {}
+              if not os.path.exists(path): return res
+              # whatweb may produce multiple JSON objects separated by newlines or a JSON array
               try:
-                  wp = WebPage.new_from_url(url, timeout=10)
-                  tech = w.analyze_with_versions_and_categories(wp) if w else {}
-                  results.append({"url": url, "tech": tech})
-                  print(f"{url} -> {list(tech.keys())[:5]}")
-              except Exception as e:
-                  print("skip", url, e)
-          with open("results/tech/wappalyzer.json", "w") as f:
-              json.dump(results, f, indent=2)
+                  data = json.load(open(path))
+                  # if it's a dict with url keys, normalize
+                  if isinstance(data, dict):
+                      for k,v in data.items():
+                          res[k] = v
+                  elif isinstance(data, list):
+                      for item in data:
+                          # item may contain 'url' or keys
+                          url = item.get("url") or item.get("target") or item.get("hostname")
+                          if url:
+                              res[url] = item
+              except Exception:
+                  # fallback: try line-based JSON objects
+                  with open(path) as fh:
+                      for line in fh:
+                          line=line.strip()
+                          if not line:
+                              continue
+                          try:
+                              obj=json.loads(line)
+                              url = obj.get("url") or obj.get("target") or obj.get("hostname")
+                              if url:
+                                  res[url]=obj
+                          except Exception:
+                              continue
+              return res
+
+          httpx_data = load_httpx("results/subdomains/live.jsonl")
+          whatweb_data = load_whatweb("results/tech/whatweb_raw.json")
+
+          summary = []
+          keys = set(list(httpx_data.keys()) + list(whatweb_data.keys()))
+          for k in sorted(keys):
+              entry = {"url": k}
+              entry.update(httpx_data.get(k, {}))
+              ww = whatweb_data.get(k, {})
+              # whatweb identifies technologies under 'software' or 'plugins' or 'plugins' depending on version
+              tech = {}
+              if isinstance(ww, dict):
+                  # try several keys
+                  for key in ("software","plugins","matches","applications"):
+                      val = ww.get(key)
+                      if val:
+                          tech[key] = val
+                  # fallback: include entire whatweb object under 'whatweb_raw'
+                  entry["whatweb_raw"] = ww
+              if tech:
+                  entry["whatweb_tech"] = tech
+              summary.append(entry)
+
+          Path("results/tech/tech-summary.json").write_text(json.dumps(summary, indent=2))
+          print("Wrote results/tech/tech-summary.json")
           PY
-          python3 tech_scan.py || true
+
+          python3 results/tech/merge_tech.py || true
+          echo "Tech summary (top 10):"
+          jq -r '.[0:10][] | "- " + .url + " | title: " + (.title // "n/a")' results/tech/tech-summary.json || true
 
       - name: "[4] Content Discovery (FFUF)"
         run: |
@@ -247,7 +302,7 @@ jobs:
           - Live: $(wc -l < results/subdomains/live.txt 2>/dev/null || echo 0)
 
           ## Technology (sample)
-          $(if [ -f results/tech/wappalyzer.json ]; then jq -r '.[] | "- " + .url + ": " + (.tech | keys | join(", "))' results/tech/wappalyzer.json | head -10; else echo "- no tech data"; fi)
+          $(if [ -f results/tech/tech-summary.json ]; then jq -r '.[] | "- " + .url + ": " + (.title // "n/a")' results/tech/tech-summary.json | head -10; else echo "- no tech data"; fi)
 
           ## Inputs
           - Forms: $(jq 'length' results/inputs/forms.json 2>/dev/null || echo 0)
@@ -276,7 +331,7 @@ jobs:
           from googleapiclient.discovery import build
           from googleapiclient.http import MediaFileUpload
 
-          sa_json = os.environ.get("GDRIVE_CLIENT_SECRET_JSON")
+          sa_json = os.environ.get("GDRIVE_SA_JSON")
           folder_id = os.environ.get("DRIVE_FOLDER_ID")
           if not sa_json or not folder_id:
               raise SystemExit("Missing GDRIVE_SA_JSON or DRIVE_FOLDER_ID")
