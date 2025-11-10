@@ -7,18 +7,25 @@ on:
         description: 'Google Drive Folder ID for results'
         required: true
         type: string
+      target:
+        description: 'Target domain (e.g. google.com)'
+        required: true
+        type: string
 
 env:
   TZ: Africa/Accra
-  DRIVE_FOLDER_ID: ${{ inputs.drive_folder_id }}
   # Provide a service account JSON (stringified) in repository secrets as GDRIVE_SA_JSON
-  GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+  GDRIVE_SA_JSON: ${{ secrets.GDRIVE_CLIENT_SECRET_JSON }}
 
 jobs:
   pentest-recon:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # make target and drive folder available to all steps via job-level env
+    env:
+      DRIVE_FOLDER_ID: ${{ inputs.drive_folder_id }}
+      TARGET: ${{ inputs.target }}
 
     steps:
       - name: Checkout Repository
@@ -32,15 +39,13 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: '1.20'   # use a stable supported go version
+          go-version: '1.20'
 
       - name: Prepare environment (GOBIN & PATH)
         run: |
-          # Use a workspace-local bin so we don't need sudo
           export GOBIN="${GITHUB_WORKSPACE}/gobin"
           mkdir -p "$GOBIN"
           echo "$GOBIN" >> $GITHUB_PATH
-          # also make go cache consistent
           export GOPATH="${GITHUB_WORKSPACE}/gopath"
           mkdir -p "$GOPATH"
           echo "$GOPATH" >> $GITHUB_ENV
@@ -51,21 +56,17 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             git wget curl unzip jq build-essential ca-certificates \
             python3-venv python3-pip whatweb gobuster
-          # ensure pip is up-to-date
           python3 -m pip install --upgrade pip
 
-      - name: Install Go-based tools (amass, httpx, subfinder, assetfinder, ffuf, gobuster v3)
+      - name: Install Go-based tools (amass, httpx, subfinder, assetfinder, ffuf, gobuster)
         env:
           GOBIN: ${{ github.workspace }}/gobin
         run: |
-          # Use explicit module installs to GOBIN (non-sudo). @latest is okay in CI;
-          # pin versions in future for reproducible builds if desired.
           go install github.com/owasp-amass/amass/v4/...@latest
           go install github.com/projectdiscovery/httpx/cmd/httpx@latest
           go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           go install github.com/tomnomnom/assetfinder@latest
           go install github.com/ffuf/ffuf@latest
-          # OJ/gobuster v3 (if apt gobuster is absent/older)
           go install github.com/OJ/gobuster/v3@latest
 
       - name: Make sure Go bin is on PATH
@@ -85,30 +86,18 @@ jobs:
       - name: "[1] Subdomain Enumeration"
         run: |
           set -euo pipefail
-          echo "Starting subdomain enumeration at $(date '+%Y-%m-%d %H:%M:%S %Z')"
-
-          TARGET="ama.gov.gh"
+          echo "Starting subdomain enumeration for $TARGET at $(date '+%Y-%m-%d %H:%M:%S %Z')"
           mkdir -p results/subdomains
 
-          # Amass enumeration (passive + active bruteforce)
           amass enum -d "$TARGET" -passive -o results/subdomains/amass_passive.txt || true
           amass enum -d "$TARGET" -brute -active -o results/subdomains/amass_active.txt || true
-
-          # subfinder (fast)
           subfinder -d "$TARGET" -o results/subdomains/subfinder.txt || true
-
-          # assetfinder
           assetfinder --subs-only "$TARGET" > results/subdomains/assetfinder.txt || true
-
-          # python sublist3r (fallback)
           python3 -m sublist3r -d "$TARGET" -o results/subdomains/sublist3r.txt || true
 
-          # combine and dedupe
-          cat results/subdomains/*.txt 2>/dev/null || true
-          grep -Eo "([a-zA-Z0-9.-]+\.$TARGET|[a-zA-Z0-9.-]+)" results/subdomains/*.txt 2>/dev/null || true
           cat results/subdomains/*.txt 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sort -u > results/subdomains/all.txt || true
 
-          echo "Unique subdomains: $(wc -l < results/subdomains/all.txt || echo 0)"
+          echo "Unique subdomains: $(wc -l < results/subdomains/all.txt 2>/dev/null || echo 0)"
           head -n 15 results/subdomains/all.txt || true
 
       - name: "[2] Live Host Probing"
@@ -120,26 +109,22 @@ jobs:
             exit 0
           fi
 
-          # httpx produces json lines; detect title/status/tech
           httpx -l results/subdomains/all.txt \
                 -title -status-code -tech-detect -silent -o results/subdomains/live.jsonl || true
 
-          # extract URLs that returned 200 (or consider other status codes)
           jq -r 'select(.status_code==200) | .url' results/subdomains/live.jsonl > results/subdomains/live.txt || true
 
-          echo "Live hosts: $(wc -l < results/subdomains/live.txt || echo 0)"
+          echo "Live hosts: $(wc -l < results/subdomains/live.txt 2>/dev/null || echo 0)"
           head -n 30 results/subdomains/live.txt || true
 
       - name: "[3] Technology Fingerprinting"
         run: |
           set -euo pipefail
           mkdir -p results/tech
-          # whatweb JSON log (limit to first 20 hosts)
           if [ -s results/subdomains/live.txt ]; then
             head -n 20 results/subdomains/live.txt | xargs -r -n1 whatweb --log-json=results/tech/whatweb.json || true
           fi
 
-          # Wappalyzer scan (python)
           cat << 'PY' > tech_scan.py
           import json
           from Wappalyzer import WebPage, Wappalyzer
@@ -174,10 +159,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p results/content
-          # Get a commonly used wordlist (raft-medium)
           wget -q -O dirs.txt https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-medium-directories.txt || true
 
-          # build target list (up to 10)
           if [ -s results/subdomains/live.txt ]; then
             head -n 10 results/subdomains/live.txt > results/content/targets.txt
           else
@@ -185,13 +168,10 @@ jobs:
             exit 0
           fi
 
-          # run ffuf per target (simple loop) to avoid complex host header juggling
           while read -r url; do
-            # ensure url has scheme, default to https if missing
             if [[ ! "$url" =~ ^https?:// ]]; then
               url="https://$url"
             fi
-            # FFUF line: target/FUZZ
             ffuf -u "${url}/FUZZ" -w dirs.txt -mc 200,301,302 -ac -t 25 -o "results/content/ffuf_$(echo "$url" | sed 's/[^a-zA-Z0-9]/_/g').json" -of json || true
           done < results/content/targets.txt
 
@@ -217,7 +197,6 @@ jobs:
               patterns = [r'["\']/api/[^\s"\'<>]+', r'fetch\(["\']([^"\']+)']
               for pattern in patterns:
                   for m in re.findall(pattern, text):
-                      # m might be "something" or a tuple; we handle string
                       endpoint = m if isinstance(m, str) else m[0]
                       full = urljoin(url, endpoint.split('?')[0])
                       if full.startswith('http') and full not in apis:
@@ -260,9 +239,9 @@ jobs:
           set -euo pipefail
           mkdir -p results
           cat << 'EOF' > results/SUMMARY.md
-          # AMA.gov.gh Penetration Test Report
+          # Penetration Test Report
           **Generated:** $(date '+%Y-%m-%d %H:%M:%S %Z')
-          **Scope:** ama.gov.gh & subdomains
+          **Target:** $TARGET
 
           ## Subdomains
           - Total: $(wc -l < results/subdomains/all.txt 2>/dev/null || echo 0)
@@ -284,11 +263,11 @@ jobs:
 
       - name: "Upload Results to Google Drive (Service Account)"
         env:
-          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
-          DRIVE_FOLDER_ID: ${{ inputs.drive_folder_id }}
+          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_CLIENT_SECRET_JSON }}
+          DRIVE_FOLDER_ID: ${{ env.DRIVE_FOLDER_ID }}
         run: |
           set -euo pipefail
-          if [ -z "$GDRIVE_SA_JSON" ]; then
+          if [ -z "${GDRIVE_SA_JSON:-}" ]; then
             echo "Missing service account JSON in GDRIVE_SA_JSON secret. Exiting."
             exit 1
           fi
@@ -298,7 +277,7 @@ jobs:
           from googleapiclient.discovery import build
           from googleapiclient.http import MediaFileUpload
 
-          sa_json = os.environ.get("GDRIVE_SA_JSON")
+          sa_json = os.environ.get("GDRIVE_CLIENT_SECRET_JSON")
           folder_id = os.environ.get("DRIVE_FOLDER_ID")
           if not sa_json or not folder_id:
               raise SystemExit("Missing GDRIVE_SA_JSON or DRIVE_FOLDER_ID")
@@ -325,6 +304,6 @@ jobs:
 
       - name: "Final Success Message"
         run: |
-          echo "Pentest Phase 1 Complete"
+          echo "Pentest Phase 1 Complete for $TARGET"
           echo "All results uploaded to Google Drive (Folder ID: $DRIVE_FOLDER_ID)"
           date '+Time in Accra: %Y-%m-%d %H:%M:%S %Z'
