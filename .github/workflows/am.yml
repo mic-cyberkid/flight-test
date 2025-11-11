@@ -309,50 +309,14 @@ jobs:
           EOF
 
           cat results/SUMMARY.md
+          
 
       # ===================== UPLOAD TO GOOGLE DRIVE =====================
 
       - name: "Upload Results to Google Drive (Service Account)"
-        env:
-          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_CLIENT_SECRET_JSON }}
-          DRIVE_FOLDER_ID: ${{ env.DRIVE_FOLDER_ID }}
         run: |
-          set -euo pipefail
-          if [ -z "${GDRIVE_SA_JSON:-}" ]; then
-            echo "Missing service account JSON in GDRIVE_SA_JSON secret. Exiting."
-            exit 1
-          fi
-          python3 - <<'PY'
-          import os, json, glob
-          from google.oauth2 import service_account
-          from googleapiclient.discovery import build
-          from googleapiclient.http import MediaFileUpload
-
-          sa_json = os.environ.get("GDRIVE_SA_JSON")
-          folder_id = os.environ.get("DRIVE_FOLDER_ID")
-          if not sa_json or not folder_id:
-              raise SystemExit("Missing GDRIVE_SA_JSON or DRIVE_FOLDER_ID")
-
-          creds_info = json.loads(sa_json)
-          creds = service_account.Credentials.from_service_account_info(creds_info, scopes=["https://www.googleapis.com/auth/drive"])
-          service = build("drive", "v3", credentials=creds, cache_discovery=False)
-
-          def upload_file(path):
-              name = os.path.basename(path)
-              metadata = {"name": name, "parents":[folder_id]}
-              media = MediaFileUpload(path, resumable=True)
-              print("Uploading", path)
-              f = service.files().create(body=metadata, media_body=media, fields="id,webViewLink").execute()
-              print("Uploaded:", f.get("webViewLink"))
-
-          for path in glob.glob("results/**/*", recursive=True):
-              if os.path.isfile(path):
-                  try:
-                      upload_file(path)
-                  except Exception as e:
-                      print("Failed to upload", path, e)
-          PY
-
+          zip results.zip -r results
+          python3 upload.py
       - name: "Final Success Message"
         run: |
           echo "Pentest Phase 1 Complete for $TARGET"
