@@ -19,12 +19,12 @@ from googleapiclient.http import MediaFileUpload
 SCOPES = ['https://www.googleapis.com/auth/drive.file']
 CLIENT_SECRET_JSON = os.getenv('GDRIVE_CLIENT_SECRET_JSON')   # whole JSON string
 TOKEN_PICKLE = 'token.pickle'
-DRIVE_FOLDER_ID = os.getenv('DRIVE_FOLDER_ID')               # from workflow env
+DRIVE_FOLDER_ID = "1zmZ63MZVWkpMPagZ6FEGVEgB7UkMiaIT"
 
 # Files to upload – change/extend as you like
 FILES_TO_UPLOAD = [
     # (local_path, mime_type, optional_new_name)
-    ("PhysicsChatbotServer-Windows.zip", "application/zip"),
+    ("results.zip", "application/zip"),
 ]
 
 # ----------------------------------------------------------------------
@@ -76,8 +76,7 @@ def upload_file(service, local_path, mime, folder_id, new_name=None):
 def main():
     if not CLIENT_SECRET_JSON:
         sys.exit("ERROR: GDRIVE_CLIENT_SECRET_JSON secret is missing")
-    if not DRIVE_FOLDER_ID:
-        sys.exit("ERROR: DRIVE_FOLDER_ID env var is missing")
+        
 
     creds = load_or_create_token()
     service = build('drive', 'v3', credentials=creds)
